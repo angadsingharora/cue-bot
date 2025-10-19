@@ -1,0 +1,3 @@
+mediapipe==0.10.7
+opencv-python==4.8.1.78
+obs-websocket-py==1.5.3

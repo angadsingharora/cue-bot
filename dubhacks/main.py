@@ -9,6 +9,106 @@ import cv2
 import mediapipe as mp
 import time
 import obsws_python as obs
+import pygame
+import numpy as np
+
+def initialize_audio():
+    """Initialize pygame mixer for audio feedback."""
+    try:
+        pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+        return True
+    except Exception as e:
+        print(f"Audio initialization failed: {e}")
+        return False
+
+def play_gesture_sound(gesture_type):
+    """Play different sounds for different gestures."""
+    try:
+        # Generate different tones for different gestures
+        if gesture_type == "thumbs_up":
+            # Generate a pleasant ascending tone
+            frequency = 440  # A4 note
+            duration = 0.3
+        elif gesture_type == "peace":
+            # Generate a different tone
+            frequency = 523  # C5 note
+            duration = 0.3
+        elif gesture_type == "fist":
+            # Generate a lower tone
+            frequency = 330  # E4 note
+            duration = 0.2
+        elif gesture_type == "open_hand":
+            # Generate a higher tone
+            frequency = 659  # E5 note
+            duration = 0.4
+        else:
+            frequency = 220  # A3 note
+            duration = 0.2
+        
+        # Create a simple sine wave tone
+        sample_rate = 22050
+        frames = int(duration * sample_rate)
+        arr = np.zeros((frames, 2))
+        
+        for i in range(frames):
+            wave = 4096 * np.sin(2 * np.pi * frequency * i / sample_rate)
+            arr[i][0] = wave  # Left channel
+            arr[i][1] = wave  # Right channel
+        
+        sound = pygame.sndarray.make_sound(arr.astype(np.int16))
+        sound.play()
+        
+    except Exception as e:
+        print(f"Error playing sound: {e}")
+
+def detect_gesture(landmarks):
+    """Detect hand gestures based on MediaPipe landmarks."""
+    if not landmarks:
+        return None
+    
+    # Get key points
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    thumb_mcp = landmarks[2]  # Thumb metacarpal
+    index_tip = landmarks[8]
+    index_pip = landmarks[6]
+    middle_tip = landmarks[12]
+    middle_pip = landmarks[10]
+    ring_tip = landmarks[16]
+    ring_pip = landmarks[14]
+    pinky_tip = landmarks[20]
+    pinky_pip = landmarks[18]
+    
+    # Check if fingers are extended
+    fingers = []
+    
+    # Thumb detection - more robust for thumbs up
+    # Check if thumb is extended outward (both x and y coordinates)
+    thumb_extended = (thumb_tip.x > thumb_ip.x and thumb_tip.y < thumb_ip.y) or \
+                    (thumb_tip.x > thumb_mcp.x and thumb_tip.y < thumb_mcp.y)
+    fingers.append(1 if thumb_extended else 0)
+    
+    # Other fingers (compare y coordinates)
+    for tip, pip in [(index_tip, index_pip), (middle_tip, middle_pip), 
+                     (ring_tip, ring_pip), (pinky_tip, pinky_pip)]:
+        if tip.y < pip.y:
+            fingers.append(1)
+        else:
+            fingers.append(0)
+    
+    # Gesture recognition
+    if fingers == [1, 0, 0, 0, 0]:  # Only thumb up (proper thumbs up)
+        return "thumbs_up"
+    elif fingers == [0, 1, 1, 0, 0]:  # Index and middle up
+        return "peace"
+    elif fingers == [0, 0, 0, 0, 0]:  # All fingers down
+        return "fist"
+    elif fingers == [1, 1, 1, 1, 1]:  # All fingers up
+        return "open_hand"
+    elif fingers == [1, 1, 0, 0, 0]:  # Thumb and index up (alternative thumbs up)
+        return "thumbs_up"
+    else:
+        return None
 
 def main():
     """Main application function."""
@@ -18,6 +118,13 @@ def main():
     
     try:
         print("DEBUG: Starting main function...")
+        
+        # Initialize audio
+        audio_available = initialize_audio()
+        if audio_available:
+            print("✓ Audio system initialized")
+        else:
+            print("⚠ Audio system unavailable - gestures will be detected but no sound will play")
         # OBS Configuration
         OBS_HOST = "localhost"
         OBS_PORT = 4455
@@ -74,6 +181,16 @@ def main():
             min_detection_confidence=0.3,
             min_tracking_confidence=0.3
         )
+        
+        # Initialize MediaPipe Hands
+        mp_hands = mp.solutions.hands
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        mp_drawing = mp.solutions.drawing_utils
 
         # Try to open both cameras with different backends
         print("Opening cameras...")
@@ -150,7 +267,11 @@ def main():
             print("✓ Using camera for both eye tracking and display:", cameras[0][0])
             print("Press 'q' to quit")
             
-            # Single camera mode - just show eye tracking
+            # Single camera mode - show eye tracking and gesture detection
+            last_gesture = None
+            gesture_counter = 0
+            last_gesture_time = 0
+            
             while True:
                 ret, frame = eye_camera.read()
                 if not ret:
@@ -159,11 +280,48 @@ def main():
                 # Convert BGR to RGB for MediaPipe
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
+                hand_results = hands.process(rgb_frame)
                 
                 if results.multi_face_landmarks:
                     cv2.putText(frame, "FACE DETECTED - SINGLE CAMERA MODE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 else:
                     cv2.putText(frame, "NO FACE DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                # Process hand gestures
+                current_gesture = None
+                if hand_results.multi_hand_landmarks:
+                    for hand_landmarks in hand_results.multi_hand_landmarks:
+                        # Draw hand landmarks
+                        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                        
+                        # Detect gesture
+                        gesture = detect_gesture(hand_landmarks.landmark)
+                        if gesture:
+                            current_gesture = gesture
+                            break
+                
+                # Handle gesture detection and audio feedback
+                current_time = time.time()
+                if current_gesture:
+                    if current_gesture == last_gesture:
+                        gesture_counter += 1
+                    else:
+                        gesture_counter = 1
+                        last_gesture = current_gesture
+                    
+                    # Play sound if gesture is stable for 5 frames and enough time has passed
+                    if (gesture_counter >= 5 and 
+                        current_time - last_gesture_time > 1.0 and 
+                        audio_available):
+                        play_gesture_sound(current_gesture)
+                        last_gesture_time = current_time
+                        print(f"🎵 Gesture detected: {current_gesture.upper()}")
+                    
+                    # Display gesture info
+                    cv2.putText(frame, f"GESTURE: {current_gesture.upper()}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                else:
+                    last_gesture = None
+                    gesture_counter = 0
                 
                 cv2.putText(frame, "Press 'q' to quit", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.imshow("Eye Tracking Camera Switcher", frame)
@@ -191,6 +349,11 @@ def main():
         gaze_counter = 0
         last_gaze_direction = "CENTER/RIGHT"
         
+        # Gesture detection variables
+        last_gesture = None
+        gesture_counter = 0
+        last_gesture_time = 0
+        
         while True:
             # Capture frame from eye tracking camera
             ret, frame = eye_camera.read()
@@ -202,8 +365,11 @@ def main():
             # Convert BGR to RGB for MediaPipe
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Process the frame
+            # Process the frame for face detection
             results = face_mesh.process(rgb_frame)
+            
+            # Process the frame for hand detection
+            hand_results = hands.process(rgb_frame)
             
             # Check if face is detected
             if results.multi_face_landmarks:
@@ -344,6 +510,42 @@ def main():
                     target_camera = 0
             else:
                 cv2.putText(frame, "NO FACE DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # Process hand gestures
+            current_gesture = None
+            if hand_results.multi_hand_landmarks:
+                for hand_landmarks in hand_results.multi_hand_landmarks:
+                    # Draw hand landmarks
+                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    
+                    # Detect gesture
+                    gesture = detect_gesture(hand_landmarks.landmark)
+                    if gesture:
+                        current_gesture = gesture
+                        break
+            
+            # Handle gesture detection and audio feedback
+            current_time = time.time()
+            if current_gesture:
+                if current_gesture == last_gesture:
+                    gesture_counter += 1
+                else:
+                    gesture_counter = 1
+                    last_gesture = current_gesture
+                
+                # Play sound if gesture is stable for 5 frames and enough time has passed
+                if (gesture_counter >= 5 and 
+                    current_time - last_gesture_time > 1.0 and 
+                    audio_available):
+                    play_gesture_sound(current_gesture)
+                    last_gesture_time = current_time
+                    print(f"🎵 Gesture detected: {current_gesture.upper()}")
+                
+                # Display gesture info
+                cv2.putText(frame, f"GESTURE: {current_gesture.upper()}", (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            else:
+                last_gesture = None
+                gesture_counter = 0
             
             cv2.putText(frame, "Press 'q' to quit", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
